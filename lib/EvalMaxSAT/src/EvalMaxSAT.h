@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <random>
 #include <queue>
+#include <limits>
 
 
 #include "utile.h"
@@ -20,6 +21,77 @@
 
 using namespace MaLib;
 
+enum class NodeType {
+    LowerBound,
+    UpperBound,
+    HardClause,
+    SoftClause,
+    CardClause
+};
+
+enum class RuleID {
+    EmptySoftClause,
+    Hardening,
+    FailedLiteral,
+    CoreRelaxation,
+    CliqueRelaxation,
+    RelaxCardinality,
+    ZeroWeightCardinality,
+    SolutionImprovement,
+    OptimumFound,
+    NoBetterSolution
+};
+
+struct NodeEntry {
+    int addressID;
+    NodeType type;
+    long long value;
+    std::vector<int> literals;
+    std::vector<int> conflict;
+    long long constraint;
+    std::vector<bool> solution;
+
+    NodeEntry(int id, NodeType t, long long val = -1, std::vector<int> lits = {}, std::vector<int> confl = {}, long long cons = -1, std::vector<bool> sol = {})
+        : addressID(id), type(t), value(val), literals(std::move(lits)), conflict(std::move(confl)), constraint(cons), solution(std::move(sol)) {}
+};
+
+struct ProofStepEntry {
+    int stepID;
+    RuleID ruleType;
+    std::vector<std::vector<int>> premiseIDs;
+    std::vector<std::vector<int>> resultIDs;
+
+    ProofStepEntry(int sid, RuleID rule, std::vector<std::vector<int>> premises = {}, std::vector<std::vector<int>> results = {})
+        : stepID(sid), ruleType(rule), premiseIDs(std::move(premises)), resultIDs(std::move(results)) {}
+};
+
+int nodeCounter = 0;
+int proofStepCounter = 0;
+
+std::vector<NodeEntry> nodeLog;
+std::vector<ProofStepEntry> proofSteps;
+
+NodeEntry& addNode(NodeType type, long long value = -1, std::vector<int> literals = {}, std::vector<int> conflict = {}, long long constraint = -1, std::vector<bool> solution = {}) {
+    NodeEntry node(nodeCounter, type, value, std::move(literals), std::move(conflict), constraint, std::move(solution));
+    nodeLog.push_back(std::move(node));
+    return nodeLog[nodeCounter++];
+}
+
+ProofStepEntry& addProofStep(RuleID rule, std::vector<std::vector<int>> premises = {}, std::vector<std::vector<int>> results = {}) {
+    ProofStepEntry step(proofStepCounter, rule, std::move(premises), std::move(results));
+    proofSteps.push_back(std::move(step));
+    return proofSteps[proofStepCounter++];
+}
+
+NodeEntry lbNode = NodeEntry(-1, NodeType::LowerBound, 0);
+NodeEntry ubNode = NodeEntry(-1, NodeType::UpperBound, std::numeric_limits<long long>::max());
+
+std::vector<const NodeEntry*> hardClauses;
+std::unordered_map<int, std::shared_ptr<NodeEntry>> lit2SoftC;
+std::unordered_map<int, std::shared_ptr<NodeEntry>> lit2CardC;
+std::map<std::tuple<std::vector<int>, t_weight>, NodeEntry*> confl2card;
+NodeEntry* latestHardC = nullptr;
+NodeEntry* latestSoftC = nullptr;
 
 
 class LocalOptimizer2 {
@@ -103,12 +175,17 @@ class EvalMaxSAT {
     ///////////////////////////
     /// Representation of the MaxSAT formula
     ///
+        // NOTE: stores pointer to SAT solver instance
         SAT_SOLVER *solver = nullptr;
+        // NOTE: stores the weight of each literal
         WeightVector _poids; // _poids[lit] = weight of lit
+        // NOTE: maps weights to literals
         std::map<t_weight, std::set<int>> _mapWeight2Assum; // _mapWeight2Assum[weight] = set of literals with this weight
+        // NOTE: tracks total cost of soft clauses
         t_weight cost = 0;
-        ////// TODO : ajouter Offset_Cost avec poids négatif !!   cost (et solutionCost?)  corespondront alors au poids sur la formule actuelle, les modification de la formule apportant des modification de poids affecterons seulement Offset_Cost  (clause de poids négatif, AM1, autre ?)
 
+        // NOTE: handels "at most k" constraints
+        // NOTE: solver may replace a group of soft literals with a single card. constr.
         struct LitCard {
             std::shared_ptr<CardIncremental_Lazy<EvalMaxSAT<SAT_SOLVER>> > card;
             int atMost;
@@ -124,9 +201,12 @@ class EvalMaxSAT {
                 return card->atMost(atMost);
             }
         };
-        std::vector< std::optional<LitCard> > _mapAssum2Card; // _mapAssum2Card[lit] = card associated to lit
 
-        std::deque< std::tuple< std::vector<int>, t_weight> > _cardToAdd;   // cardinality to add
+        // NOTE: maps soft literals to their corresponding cardinality constraints
+        std::vector< std::optional<LitCard> > _mapAssum2Card; // _mapAssum2Card[lit] = card associated to lit
+        // NOTE: stores new cardinality constraints to be added later
+        std::deque< std::tuple< std::vector<int>, t_weight> > _cardToAdd; // cardinality to add
+        // NOTE: literals that need to be relaxed, i.e. convereted from hard to soft
         std::vector<int> _litToRelax; // Lit to relax
     ///
     //////////////////////////
@@ -134,8 +214,11 @@ class EvalMaxSAT {
     ///////////////////////////
     /// Best solution found so far
     ///
+        // NOTE: stores best assignment found so far
         std::vector<bool> solution;
+        // NOTE: stores the minimum cost
         t_weight solutionCost = std::numeric_limits<t_weight>::max();
+        
     ///
     //////////////////////////
 private:
@@ -149,8 +232,11 @@ private:
         double _maximalRefTime = 5*60;
         TimeOut totalSolveTimeout = TimeOut(0.9 * 3600 );
 
+        // NOTE: delay certain simplifications to avoid unnecessary work
         bool _delayStrategy = true;
+        // NOTE: allows running multiple SAT solver calls in parallel
         bool _multiSolveStrategy = true;
+        // NOTE: uses upper bounds to speed up optimization
         bool _UBStrategy = true;
     ///
     //////////////////////////////
@@ -162,8 +248,6 @@ private:
     }
 
 public:
-
-
 
     ///////////////////////////
     /// Setter
@@ -190,10 +274,12 @@ public:
         void setTargetComputationTime(double targetComputationTime) {
             totalSolveTimeout = TimeOut( targetComputationTime * 0.9 );
         }
+        // NOTE: limits total solving time
         void setBoundRefTime(double minimalRefTime, double maximalRefTime) {
             _minimalRefTime = minimalRefTime;
             _maximalRefTime = maximalRefTime;
         }
+        // NOTE: adjusts core-refining time bounds
         void unactivateDelayStrategy() {
             _delayStrategy = false;
         }
@@ -207,7 +293,8 @@ public:
     ////////////////////////
 
 
-    public:
+public:
+
     EvalMaxSAT() : solver(new SAT_SOLVER) {
         _poids.push_back(0);          // Fake lit with id=0
         _mapAssum2Card.push_back({});  // Fake lit with id=0
@@ -216,7 +303,10 @@ public:
     ~EvalMaxSAT() {
         delete solver;
     }
+
 public:
+
+    // NOTE: function to print hyperparameters and solving constraints
     void printInfo() {
         std::cout << "c PARAMETRE INFORMATION: " << std::endl;
         std::cout << "c Stop unsat improving after " << totalSolveTimeout.getVal() << " sec" << std::endl;
@@ -225,11 +315,12 @@ public:
         std::cout << "c Average coef = " << _averageCoef << std::endl;
     }
 
-
+    // NOTE: checks if the problem is weighted
     bool isWeighted() {
         return _mapWeight2Assum.size() > 1;
     }
 
+    // NOTE: creates a new boolean variable for the solver (has weight 0)
     int newVar(bool decisionVar=true) {
         _poids.push_back(0);
         _mapAssum2Card.push_back({});
@@ -241,15 +332,22 @@ public:
         return var;
     }
 
+    // NOTE: creates soft variable (keeps track of weight)
+    // NOTE: For negated variables we use negative weight
     int newSoftVar(bool value, long long weight) {
         if(weight < 0) {
-            ///// TODO: ajouer Offset_Cost -= weight
+            std::cout << "ERROR 1: Negative variable weight:" << value << " with weight " << weight << std::endl;
             value = !value;
             weight = -weight;
+        }
+        if (weight * (((int)value)*2 - 1) < 0) {
+            std::cout << "ERROR 2: Negative variable weight:" << value << " with weight " << weight << std::endl;
         }
 
         _poids.push_back(weight * (((int)value)*2 - 1));
         _mapAssum2Card.push_back({});
+        // computes the signed index of the literal
+        // sign of index only becomes negative if the weight is negative 
         _mapWeight2Assum[weight].insert( (((int)value*2) - 1) * ((int)(_poids.size())-1) );
 
         int var = solver->newVar();
@@ -258,12 +356,16 @@ public:
         return var;
     }
 
+    // NOTE: adding clauses (soft and hard)
     int addClause(const std::vector<int> &clause, std::optional<long long> w = {}) {
-        if( w.has_value() == false ) { // Hard clause
+        int clauseAddressID = -1;
+        if( !w.has_value() ) { // Hard clause
             if( (clause.size() == 1) && ( _poids[clause[0]] != 0 ) ) {
                 if( _poids[clause[0]] < 0 ) {
+                    // NOTE: I am assuming that this part never occures.
                     assert( _mapWeight2Assum[ _poids[-clause[0]] ].count( -clause[0] ) );
                     _mapWeight2Assum[ _poids[-clause[0]] ].erase( -clause[0] );
+                    std::cout << "This part should not occur." << std::endl;
                     cost += _poids[-clause[0]];
                     relax(clause[0]);
                 } else {
@@ -271,40 +373,51 @@ public:
                     _mapWeight2Assum[ _poids[clause[0]] ].erase( clause[0] );
                 }
                 _poids.set(clause[0], 0);
-                //relax(clause[0]);
             }
-
+            latestHardC = &addNode(NodeType::HardClause, -1, clause, {}, -1, {});
+            hardClauses.push_back(latestHardC);
             solver->addClause(clause);
         } else {
-            if(w.value() == 0)
-                return 0;
+            if(w.value() == 0) return 0;
             if(clause.size() > 1) { // Soft clause, i.e, "hard" clause with a soft var at the end
                 if( w.value() > 0 ) {
                     auto softVar = newSoftVar(true, w.value());
                     std::vector<int> softClause = clause;
                     softClause.push_back( -softVar );
-                    addClause(softClause);
+                    addClause(softClause, std::nullopt);
                     assert(softVar > 0);
+                    latestSoftC = &addNode(NodeType::SoftClause, w.value(), {softVar}, {}, -1, {});
+                    lit2SoftC[softVar] = std::shared_ptr<NodeEntry>(latestSoftC);
                     return softVar;
                 } else {
                     assert(w.value() < 0);
                     auto softVar = newSoftVar(true, -w.value());
                     for(auto lit: clause) {
-                        addClause({ -softVar, lit });
+                        addClause({ -softVar, lit }, std::nullopt);
                     }
                     assert(softVar > 0);
+                    std::cout << "ERROR 3: Negative variable weight:" << clause << " with weight " << w.value() << std::endl;
+                    latestSoftC = &addNode(NodeType::SoftClause, w.value(), {softVar}, {}, -1, {});
+                    lit2SoftC[softVar] = std::shared_ptr<NodeEntry>(latestSoftC);
                     return softVar;
                 }
             } else if(clause.size() == 1) { // Special case: unit clause.
                 addWeight(clause[0], w.value());
+                latestSoftC = &addNode(NodeType::SoftClause, w.value(), clause, {}, -1, {});
+                lit2SoftC[clause[0]] = std::shared_ptr<NodeEntry>(latestSoftC);
             } else { assert(clause.size() == 0); // Special case: empty soft clause.
+                // An empty clause means that in can be satisified, thus we are obliged to add its weight
                 cost += w.value();
+                latestSoftC = &addNode(NodeType::SoftClause, w.value(), clause, {}, -1, {});
+                NodeEntry& newLbNode = addNode(NodeType::LowerBound, cost, {}, {}, -1, {});
+                addProofStep(RuleID::EmptySoftClause, {{lbNode.addressID}, {latestSoftC->addressID}}, {{newLbNode.addressID}});
+                lbNode = newLbNode;
             }
         }
         return 0;
     }
 
-
+    // NOTE: this retrieves the variable assignment of a given literal
     bool getValue(int lit) {
         if(abs(lit) > solution.size())
             return false;
@@ -319,6 +432,9 @@ public:
 
 private:
 
+    // NOTE: selects soft literals that must be assumed true during solving
+    // NOTE: starts with highest-weighted assumptions
+    // NOTE: solver gradually weakens assumptions, making the problem more relaxed
     std::set<int> initAssum(t_weight minWeightToConsider=1) {
         std::set<int> assum;
 
@@ -333,44 +449,91 @@ private:
     }
 
     bool toOptimize = true;
+
 public:
+
     void disableOptimize() {
         toOptimize = false;
     }
 
     bool solve() {
-        // TODO: Support incremental solve
 
         totalSolveTimeout.restart();
 
+        std::cout << "c [Proof] Starting MaxSAT solving process..." << std::endl;
+
         MonPrint("c initial cost = ", cost);
+
+        // NOTE: tracks which literals are assumed to be true
         std::set<int> assum;
+
+        // NOTE: stores last satisfiable assumption set
         std::set<int> lastSatAssum;
 
         Chrono chronoLastSolve;
         Chrono chronoLastOptimize;
 
+        // NOTE: Detects at-most-one constraints: if a group of variables cannot all be true
+        // simultaneously, the solver encodes that constraint.
         adapt_am1_exact();
         adapt_am1_FastHeuristicV7();
 
+        // NOTE: exit if current cost is aleady as low as best-known solution.
         if(cost >= solutionCost) {
+            addProofStep(RuleID::OptimumFound, {{lbNode.addressID}}, {{ubNode.addressID}});
             return true;
         }
 
+        // NOTE: check if there are no soft clauses, then it is just a SAT problem
         if(_mapWeight2Assum.size() == 0) {
             if(solver->solve()) {
                 solutionCost = cost;
                 solution = solver->getSolution();
+
+                std::vector<int> hardClauseIDs;
+                for (const NodeEntry* clause : hardClauses) {
+                    hardClauseIDs.push_back(clause->addressID);
+                }
+
+                std::vector<int> softClauseIDs;
+                for (const auto& [lit, node] : lit2SoftC) {
+                    if (node) {
+                        softClauseIDs.push_back(node->addressID);
+                    }
+                }
+
+                std::vector<int> cardClauseIDs;
+                for (const auto& [lit, node] : lit2CardC) {
+                    if (node) {
+                        cardClauseIDs.push_back(node->addressID);
+                    }
+                }
+
+                NodeEntry& newUbNode = addNode(NodeType::UpperBound, solutionCost, {}, {}, -1, solution);
+
+                std::vector<std::vector<int>> premises;
+                premises.push_back({ubNode.addressID});
+                premises.push_back(hardClauseIDs);
+                premises.push_back(softClauseIDs);
+                premises.push_back(cardClauseIDs);
+                addProofStep(RuleID::SolutionImprovement, premises, {{newUbNode.addressID}});
+                ubNode = newUbNode;
+
+                addProofStep(RuleID::OptimumFound, {{lbNode.addressID}}, {{ubNode.addressID}});
                 return true;
             }
-            
             return false;
         }
 
+        // NOTE: Checks if there is an early solution
+        // by checking if any literal can be hardened and conflicts can be resolved
+        // If yes, check if LB >= UB
+        // If yes, we have found optimal solution
         if(harden(assum)) {
             assert(_mapWeight2Assum.size());
             if(adapt_am1_VeryFastHeuristic()) {
                 if(cost >= solutionCost) {
+                    addProofStep(RuleID::OptimumFound, {{lbNode.addressID}}, {{ubNode.addressID}});
                     return true;
                 }
             }
@@ -378,7 +541,8 @@ public:
 
         ///////////////////
         /// For harden via optimize
-        ///
+        /// 
+            // NOTE: ensures that no pending cardinality constraints or literal relaxations exist before optimizaiton
             assert(_cardToAdd.size() == 0);
             assert(_litToRelax.size() == 0);
             assert( [&](){
@@ -396,59 +560,85 @@ public:
 
 
         // Initialize assumptions
+        // NOTE: chooses the starting weight threshold for soft constraint and intializes the assumptions for the SAT solver.
         auto minWeightToConsider = chooseNextMinWeight( _mapWeight2Assum.rbegin()->first + 1 );
         assum = initAssum(minWeightToConsider);
 
-        //std::cout << "o " << solutionCost << std::endl;
-
         int resultLastSolve;
+
+        // NOTE: infinite solving loop
         for(;;) {
             MonPrint("Full SAT...");
             assert( _cardToAdd.size() == 0 );
             assert( _litToRelax.size() == 0 );
 
             if(cost >= solutionCost) {
+                addProofStep(RuleID::OptimumFound, {{lbNode.addressID}}, {{ubNode.addressID}});
                 return true;
             }
-
+            
             chronoLastSolve.tic();
             {
-
-                 assert( assum == initAssum(minWeightToConsider) );
-
-                //Chrono2 log("solve ");
+                assert( assum == initAssum(minWeightToConsider) );
                 resultLastSolve = solver->solve(assum);
                 MonPrint("resultLastSolve = ", resultLastSolve);
                 if(resultLastSolve == 1) {
                     lastSatAssum = assum;
                 }
             }
+
+            std::cout << "c [Proof] SAT output: " << (resultLastSolve == 1 ? "SAT" : "UNSAT") << std::endl;
+
             chronoLastSolve.pause(true);
+            // NOTE: If the solution is satisfiable, check if the lowest weight (1) has been reached.
+            // NOTE: If no, adjust the assumptions 
             if(resultLastSolve) { // SAT
                 if(minWeightToConsider == 1) {
                     solutionCost = cost;
                     solution = solver->getSolution();
+
+                    std::vector<int> hardClauseIDs;
+                    for (const NodeEntry* clause : hardClauses) {
+                        hardClauseIDs.push_back(clause->addressID);
+                    }
+
+                    std::vector<int> softClauseIDs;
+                    for (const auto& [lit, node] : lit2SoftC) {
+                        if (node) {
+                            softClauseIDs.push_back(node->addressID);
+                        }
+                    }
+
+                    NodeEntry& newUbNode = addNode(NodeType::UpperBound, solutionCost, {}, {}, -1, solution);
+                    addProofStep(RuleID::SolutionImprovement, {{ubNode.addressID}, hardClauseIDs, softClauseIDs}, {{newUbNode.addressID}});
+                    ubNode = newUbNode;
+                    addProofStep(RuleID::OptimumFound, {{lbNode.addressID}}, {{ubNode.addressID}});
                     return true; // Solution found
                 }
-
                 minWeightToConsider = chooseNextMinWeight(minWeightToConsider);
                 assum = initAssum(minWeightToConsider);
 
             } else { // UNSAT
+                // NOTE: solver extracts an unsat core
                 for(;;) {
                     if(resultLastSolve == 0) { // UNSAT
                         double maxLastSolveOr1 = std::min<double>(_minimalRefTime + chronoLastSolve.tacSec(), _maximalRefTime);
 
                         auto conflict = solver->getConflict(assum);
                         MonPrint("conflict size = ", conflict.size(), " trouvé en ", chronoLastSolve.tacSec(), "sec, donc maxLastSolveOr1 = ", maxLastSolveOr1);
-
+                        
                         if(conflict.size() == 0) {
                             MonPrint("Fin par coupure !");
                             assert(solver->solve() == 0);
+                            // We get an Unsat but with no conflict (meaning that the soft clauses do not affect the UNSAT result)
+                            // If we have previously found a valid solution, we use it as optimal solution
+                            addProofStep(RuleID::NoBetterSolution, {{lbNode.addressID}}, {{ubNode.addressID}});
                             return solutionCost != std::numeric_limits<t_weight>::max();
                         }
 
                         // 1. find better core : seconds solve
+                        // NOTE: The following does not affect the proof, as we have not yet added the conflict core,
+                        // and this only tries to find an "optimized" version of the core.
                         unsigned int nbSolve=0;
                         unsigned int lastImprove = 0;
                         double bestP = std::numeric_limits<double>::max();
@@ -487,11 +677,14 @@ public:
                         }
 
                         // 2. minimize core
+
+                        // NOTE: reduces the conflict by removing unnecessary literals
                         if(conflict.size() > 1) {
                             oneMinimize(conflict, maxLastSolveOr1, 1000);
                         }
 
                         if(conflict.size() == 0) {
+                            addProofStep(RuleID::NoBetterSolution, {{lbNode.addressID}}, {{ubNode.addressID}});
                             return solutionCost != std::numeric_limits<t_weight>::max();
                         }
 
@@ -504,6 +697,62 @@ public:
                             }
                         }
                         assert(minWeight>0);
+
+                        std::vector<int> hardClauseIDs;
+                        for (const NodeEntry* hc : hardClauses)
+                            hardClauseIDs.push_back(hc->addressID);
+
+                        std::vector<int> softClauseIDs;
+                        for (const auto& [lit, node] : lit2SoftC) {
+                            if (node) {
+                                softClauseIDs.push_back(node->addressID);
+                            }
+                        }
+
+                        std::vector<int> cardClauseIDs;
+                        for (const auto& [lit, node] : lit2SoftC) {
+                            if (node) {
+                                cardClauseIDs.push_back(node->addressID);
+                            }
+                        }
+
+                        std::vector<int> conflictsIDs;
+                        std::vector<int> updatedSoftCIDs;
+                        for (int lit : conflict) {
+                            auto it = lit2SoftC.find(lit);
+                            if (it != lit2SoftC.end()) {
+                                conflictsIDs.push_back(it->second->addressID);   
+                                NodeEntry& updatedSC = addNode(NodeType::SoftClause, it->second->value - minWeight, it->second->literals, it->second->conflict, -1, {});
+                                updatedSoftCIDs.push_back(updatedSC.addressID);
+                                lit2SoftC[lit] = std::shared_ptr<NodeEntry>(&updatedSC);
+                            }
+                        }
+
+                        std::vector<int> updatedCardCIDs;
+                        for (int lit : conflict) {
+                            auto it = lit2CardC.find(lit);
+                            if (it != lit2CardC.end()) {
+                                NodeEntry& updatedCC = addNode(NodeType::CardClause, it->second->value - minWeight, it->second->literals, it->second->conflict, it->second->constraint, {});
+                                updatedCardCIDs.push_back(updatedCC.addressID);
+                                lit2CardC[lit] = std::shared_ptr<NodeEntry>(&updatedCC);
+                            }
+                        }
+
+                        std::vector<int> assumptionsIDs;
+                        for (int lit : assum) {
+                            auto softIt = lit2SoftC.find(lit);
+                            if (softIt != lit2SoftC.end()) {
+                                assumptionsIDs.push_back(softIt->second->addressID);
+                                continue;
+                            }
+                            auto cardIt = lit2CardC.find(lit);
+                            if (cardIt != lit2CardC.end()) {
+                                assumptionsIDs.push_back(cardIt->second->addressID);
+                                continue;
+                            }
+                            std::cerr << "[Warning] Assumption literal " << lit << " not found in lit2SoftC or lit2CardC.\n";
+                        }
+
                         for(auto lit: conflict) {
                             _mapWeight2Assum[_poids[lit]].erase( lit );
                             _poids.add(lit, -minWeight);
@@ -515,7 +764,6 @@ public:
                                 _mapWeight2Assum[_poids[lit]].insert( lit );
                             }
                             assert(_poids[lit] >= 0);
-
                             if(_poids[lit] < minWeightToConsider) {
                                 assum.erase(lit);
                             }
@@ -526,9 +774,17 @@ public:
                         }
                         _cardToAdd.push_back( {conflict, minWeight} );
                         MonPrint("cost = ", cost, " + ", minWeight);
+
                         cost += minWeight;
+                        NodeEntry& newLbNode = addNode(NodeType::LowerBound, cost, {}, {}, -1, {});
+                        NodeEntry& cardC = addNode(NodeType::CardClause, minWeight, {}, conflict, -1, {});
+                        confl2card[{conflict, minWeight}] = &cardC;
+                        addProofStep(RuleID::CoreRelaxation, {{lbNode.addressID}, hardClauseIDs, softClauseIDs, cardClauseIDs, assumptionsIDs, conflictsIDs}, {{newLbNode.addressID}, updatedSoftCIDs, updatedCardCIDs, {cardC.addressID}});
+                        lbNode = newLbNode;
+
                         if(cost == solutionCost) {
                             MonPrint("c UB == LB");
+                            addProofStep(RuleID::OptimumFound, {{lbNode.addressID}}, {{ubNode.addressID}});
                             return true;
                         }
                         MonPrint(_mapWeight2Assum.rbegin()->first, " >= ", solutionCost, " - ", cost, " (", solutionCost - cost, ") ?");
@@ -562,10 +818,31 @@ public:
                                     auto curCost = LO.optimize( curSolution, std::min(0.1 * chronoLastOptimize.tacSec(), 60.0) );
 
                                     if(curCost < solutionCost) {
-                                        std::cout << "o " << curCost << std::endl;
                                         solutionCost = curCost;
                                         solution = curSolution;
 
+                                        std::vector<int> hardClauseIDs;
+                                        for (const NodeEntry* clause : hardClauses) {
+                                            hardClauseIDs.push_back(clause->addressID);
+                                        }
+
+                                        std::vector<int> softClauseIDs;
+                                        for (const auto& [lit, node] : lit2SoftC) {
+                                            if (node) {
+                                                softClauseIDs.push_back(node->addressID);
+                                            }
+                                        }
+
+                                        std::vector<int> cardClauseIDs;
+                                        for (const auto& [lit, node] : lit2CardC) {
+                                            if (node) {
+                                                cardClauseIDs.push_back(node->addressID);
+                                            }
+                                        }
+
+                                        NodeEntry& newUbNode = addNode(NodeType::UpperBound, solutionCost, {}, {}, -1, solution);
+                                        addProofStep(RuleID::SolutionImprovement, {{ubNode.addressID}, hardClauseIDs, softClauseIDs, cardClauseIDs}, {{newUbNode.addressID}});
+                                        ubNode = newUbNode;
                                         if(harden(assum)) {
                                             assert(_mapWeight2Assum.size());
 
@@ -578,7 +855,7 @@ public:
                                 }
                             ///
                             ////////////////
-
+                            
                             while(_cardToAdd.size()) {
                                 std::shared_ptr<CardIncremental_Lazy<EvalMaxSAT<SAT_SOLVER>>> card = std::make_shared<CardIncremental_Lazy<EvalMaxSAT<SAT_SOLVER>>>(this, std::get<0>(_cardToAdd.front()), 1);
                                 int newAssumForCard = card->atMost(1);
@@ -591,6 +868,12 @@ public:
 
                                     if( _poids[newAssumForCard] >= minWeightToConsider ) {
                                         assum.insert(newAssumForCard);
+                                    }
+
+                                    auto id = confl2card.find(_cardToAdd.front());
+                                    if (id != confl2card.end()) {
+                                        id->second->literals = std::vector<int>{newAssumForCard};
+                                        id->second->constraint = 1;
                                     }
                                 }
                                 _cardToAdd.pop_front();
@@ -653,8 +936,15 @@ public:
                         if( _poids[newAssumForCard] >= minWeightToConsider ) {
                             assum.insert(newAssumForCard);
                         }
+
+                        auto id = confl2card.find(c);
+                        if (id != confl2card.end()) {
+                            id->second->literals = std::vector<int>{newAssumForCard};
+                            id->second->constraint = 1;
+                        }
                     }
                 }
+                confl2card.clear();
                 _cardToAdd.clear();
             }
         }
@@ -663,9 +953,10 @@ public:
         return true;
     }
 
+private:
 
-    private:
-
+    // NOTE: moves soft variables (assumptions) to hard constraints when their cost is 
+    // too high compared to the current best known solution.
     int harden(std::set<int> &assum) {
         if(_mapWeight2Assum.size() == 0)
             return 0;
@@ -676,8 +967,10 @@ public:
         }
 
         int nbHarden = 0;
-        t_weight maxCostLit = solutionCost - cost;
 
+        // NOTE: highest weight that can still contribute to an improved solution.
+        // NOTE: soft lit with weight => maxCostLit will be hardened
+        t_weight maxCostLit = solutionCost - cost;
 
         while( _mapWeight2Assum.rbegin()->first >= maxCostLit ) {
             assert(_mapWeight2Assum.size());
@@ -686,8 +979,38 @@ public:
 
             for(auto lit: lits) {
                 assert( _poids[lit] >= maxCostLit );
-                addClause({lit});
+
+                std::vector<int> hardClauseIDs;
+                for (const NodeEntry* clause : hardClauses) {
+                    hardClauseIDs.push_back(clause->addressID);
+                }
+                std::vector<int> softClauseIDs;
+                for (const auto& [lit, node] : lit2SoftC) {
+                    if (node) {
+                        softClauseIDs.push_back(node->addressID);
+                    }
+                }
+                std::vector<int> cardClauseIDs;
+                for (const auto& [lit, node] : lit2SoftC) {
+                    if (node) {
+                        cardClauseIDs.push_back(node->addressID);
+                    }
+                }
+
+                NodeEntry* scNode = nullptr;
+                if (lit2SoftC.find(lit) != lit2SoftC.end()) {
+                    scNode = lit2SoftC[lit].get();
+                    lit2SoftC.erase(lit); // optional: cleanup
+                } else if (lit2CardC.find(lit) != lit2CardC.end()) {
+                    scNode = lit2CardC[lit].get();
+                    lit2CardC.erase(lit);
+                }
                 assum.erase(lit);
+                assert(scNode != nullptr);
+
+                addClause({lit}, std::nullopt);
+
+                addProofStep(RuleID::Hardening, {{lbNode.addressID}, {ubNode.addressID}, hardClauseIDs, softClauseIDs, cardClauseIDs, {scNode->addressID}}, {{latestHardC->addressID}});
                 nbHarden++;
             }
 
@@ -701,11 +1024,12 @@ public:
         }
 
         MonPrint("c NUMBER HARDEN : ", nbHarden);
-
         return nbHarden;
     }
 
-
+    // NOTE: Takes a set of conflicting literals and tries to remove literals that do not
+    // contribute to making the conflict unsatisfiable. Uses time constraints to control how much
+    // effort is spent on mimization. Also sorts literals by weight. Checks if latest literals change result to SAT.
     double oneMinimize(std::vector<int>& conflict, double referenceTimeSec, unsigned int B=10, bool sort=true) {
         Chrono C;
         double minimize=0;
@@ -728,7 +1052,6 @@ public:
                 });
             //}
         }
-
         if(conflict.size()==0) {
             return 0;
         }
@@ -744,6 +1067,7 @@ public:
                 MonPrint("\t\tbreak minimize");
                 return conflict.size() / (double)_poids[ conflict.back() ];
             }
+
         }
 
         t_weight weight = _poids[conflict.back()];
@@ -836,7 +1160,16 @@ public:
                     }
                     i++;
                 } else { // No solution - Remove literal from the assumptions and add its opposite as a clause
-                    addClause({-lit1});
+                    // NOTE: Lit leads to an immediate contradiction, and thus we add -Lit as a hard clause
+                    std::vector<int> hardClauseIDs;
+                    for (const NodeEntry* clause : hardClauses) {
+                        hardClauseIDs.push_back(clause->addressID);
+                    }
+                    addClause({-lit1}, std::nullopt);
+                    std::vector<std::vector<int>> premises;
+                    premises.push_back(hardClauseIDs);
+                    premises.push_back({lit1});
+                    addProofStep(RuleID::FailedLiteral, premises, {{latestHardC->addressID}});
 
                     assumption[i] = assumption.back();
                     assumption.pop_back();
@@ -894,6 +1227,7 @@ public:
                     auto newAssum = processAtMostOne(clause);
                     assert(qsize >= newAssum.size());
 
+                    // NOTE: Replace old literals with new constrained ones.
                     for(unsigned int j=0; j<newAssum.size() ; j++) {
                         assumption[ qmax[j] ] = newAssum[j];
                         active[ qmax[j] ] = true;
@@ -911,8 +1245,14 @@ public:
                                 }
                             }
                          } else {
+                            // NOTE: Lit leads to an immediate contradiction, and thus we add -Lit as a hard clause
                             assert(solver->solve(std::vector<int>({newAssum[j]})) == false);
-                            addClause({-newAssum[j]});
+                            std::vector<int> hardClauseIDs;
+                            for (const NodeEntry* clause : hardClauses) {
+                                hardClauseIDs.push_back(clause->addressID);
+                            }
+                            addClause({-newAssum[j]}, std::nullopt);
+                            addProofStep(RuleID::FailedLiteral, { hardClauseIDs, {newAssum[j]} }, {{latestHardC->addressID}});
                          }
                     }
                 }
@@ -938,6 +1278,9 @@ public:
                     return true;
                 }());
 
+                // NOTE: find the smallest weight among all literals in the clique,
+                // because we need to subtract this weight from all literals, ensuring 
+                // that at least one is chosen.
                 auto saveClause = clause;
                 auto w = _poids[ clause[0] ];
                 assert(w > 0);
@@ -948,7 +1291,9 @@ public:
                     }
                 }
                 assert(w > 0);
-
+                
+                // NOTE: We now subtract w (chosen weight) from each literal's weight
+                // some literals have weight 0, meaning they are "hardened"
                 for(unsigned int i=0; i<clause.size(); ) {
                     assert( _poids[clause[i]] > 0 );
                     assert( _mapWeight2Assum[ _poids[ clause[i] ] ].count( clause[i] ) );
@@ -967,10 +1312,55 @@ public:
                     }
                 }
                 MonPrint("AM1: cost = ", cost, " + ", w * (t_weight)(saveClause.size()-1));
-                cost += w * (t_weight)(saveClause.size()-1);
 
+                cost += w * (t_weight)(saveClause.size()-1);
                 assert(saveClause.size() > 1);
-                newAssum.push_back( addClause(saveClause, w) );
+
+                std::vector<int> hardClausesIds;
+                for (const NodeEntry* clause : hardClauses) {
+                    hardClausesIds.push_back(clause->addressID);
+                }
+                std::vector<int> softClauseIDs;
+                for (const auto& [lit, node] : lit2SoftC) {
+                    if (node) {
+                        softClauseIDs.push_back(node->addressID);
+                    }
+                }
+                std::vector<int> cardClauseIDs;
+                for (const auto& [lit, node] : lit2SoftC) {
+                    if (node) {
+                        cardClauseIDs.push_back(node->addressID);
+                    }
+                }
+
+                std::vector<int> conflictsIDs;
+                std::vector<int> updatedSoftCIDs;
+                for (int lit : saveClause) {
+                    auto it = lit2SoftC.find(lit);
+                    if (it != lit2SoftC.end()) {
+                        conflictsIDs.push_back(it->second->addressID);   
+                        NodeEntry& updatedSC = addNode(NodeType::SoftClause, it->second->value - w, it->second->literals, it->second->conflict, -1, {});
+                        updatedSoftCIDs.push_back(updatedSC.addressID);
+                        lit2SoftC[lit] = std::shared_ptr<NodeEntry>(&updatedSC);
+                    }
+                }
+                std::vector<int> updatedCardCIDs;
+                for (int lit : saveClause) {
+                    auto it = lit2CardC.find(lit);
+                    if (it != lit2CardC.end()) {
+                        NodeEntry& updatedCC = addNode(NodeType::CardClause, it->second->value - w, it->second->literals, it->second->conflict, it->second->constraint, {});
+                        updatedCardCIDs.push_back(updatedCC.addressID);
+                        lit2CardC[lit] = std::shared_ptr<NodeEntry>(&updatedCC);
+                    }
+                }
+
+                int softLit = addClause(saveClause, w);
+                newAssum.push_back(softLit);
+
+                NodeEntry& newLbNode = addNode(NodeType::LowerBound, cost, {}, {}, -1, {});
+                addProofStep(RuleID::CliqueRelaxation, {{lbNode.addressID}, hardClausesIds, softClauseIDs, cardClauseIDs, conflictsIDs}, {{newLbNode.addressID}, updatedSoftCIDs, updatedCardCIDs, {latestHardC->addressID}, {latestSoftC->addressID}});
+                lbNode = newLbNode;
+
                 assert(newAssum.back() != 0);
                 assert( _poids[ newAssum.back() ] > 0 );
             }
@@ -1002,6 +1392,9 @@ public:
             }
         }
 
+        // NOTE: iterate over soft literals and propagate each literal.
+        // NOTE: Detects pairwise conflicts using unit propagation only.
+        // NOTE: No clique reduction, only pairwise checks.
         unsigned int adapt_am1_VeryFastHeuristic() {
             std::vector<int> prop;
             unsigned int nbCliqueFound=0;
@@ -1029,13 +1422,24 @@ public:
                     }
                 } else {
                     nbCliqueFound++;
-                    addClause({-LIT});
+                    // NOTE: Setting LIT to true would lead to unsat, thus we add the inverse
+                    std::vector<int> hardClauseIDs;
+                    for (const NodeEntry* clause : hardClauses) {
+                        hardClauseIDs.push_back(clause->addressID);
+                    }
+                    addClause({-LIT}, std::nullopt);
+                    std::vector<std::vector<int>> premises;
+                    premises.push_back(hardClauseIDs);
+                    premises.push_back({LIT});
+                    addProofStep(RuleID::FailedLiteral, premises, {{latestHardC->addressID}});
                 }
             }
 
             return nbCliqueFound;
         }
 
+        // NOTE: iterate over soft literals and propagate each literal.
+        // NOTE: Builds a clique of conflicting literals and converts them into cardinality constraints.
         unsigned int adapt_am1_FastHeuristicV7() {
             MonPrint("adapt_am1_FastHeuristic : (_weight.size() = ", _poids.size(), " )");
 
@@ -1081,7 +1485,16 @@ public:
                     }
                 } else {
                     nbCliqueFound++;
-                    addClause({-LIT});
+                    // NOTE: Setting LIT to true would lead to unsat, thus we add the inverse
+                    std::vector<int> hardClauseIDs;
+                    for (const NodeEntry* clause : hardClauses) {
+                        hardClauseIDs.push_back(clause->addressID);
+                    }
+                    addClause({-LIT}, std::nullopt);
+                    std::vector<std::vector<int>> premises;
+                    premises.push_back(hardClauseIDs);
+                    premises.push_back({LIT});
+                    addProofStep(RuleID::FailedLiteral, premises, {{latestHardC->addressID}});
                 }
             }
 
@@ -1094,6 +1507,8 @@ public:
 
 
 public:
+
+    // NOTE: Adds a weight to a literal in a Weighted MaxSAT problem. If the literal already has a weight, it updates it accordingly.
     void addWeight(int lit, long long weight) {
         assert(lit != 0);
         assert(weight != 0 && "Not an error, but it should not happen");
@@ -1110,15 +1525,18 @@ public:
             _poids.set(lit, weight);
             _mapWeight2Assum[weight].insert(lit);
         } else {
+            long long prevWeight = _poids[lit];
+
             if( _poids[lit] > 0 ) {
                 assert( _mapWeight2Assum[_poids[lit]].count( lit ) );
                 _mapWeight2Assum[_poids[lit]].erase( lit );
                 _poids.add(lit, weight);
                 assert( _poids[lit] < 0 ? !_mapAssum2Card[lit].has_value() : true ); // If -lit becomes a soft var, it should not be a cardinality
-            } else { // if( _poids[lit] < 0 )
+            } else { 
+                // if( _poids[lit] < 0 )
+                // NOTE: I am assuming that the weight can never be negative!
                 assert( _mapWeight2Assum[_poids[-lit]].count( -lit ) );
                 _mapWeight2Assum[_poids[-lit]].erase( -lit );
-
                 cost += std::min(weight, _poids[-lit]);
                 _poids.add(lit, weight);
                 assert( _poids[-lit] > 0 ? !_mapAssum2Card[-lit].has_value() : true ); // If lit becomes a soft var, it should not be a cardinality
@@ -1135,8 +1553,8 @@ public:
             }
         }
     }
-private:
 
+private:
 
     // If a soft variable is not soft anymore, we have to check if this variable is a cardinality, in which case, we have to relax the cardinality.
     std::optional<int> relax(int lit) {
@@ -1145,6 +1563,9 @@ private:
 
         unsigned int var = abs(lit);
 
+        // NOTE: if lit was used in an AtMost-k constraint, then we need to increase k by 1
+        // NOTE: to do so, it introduces a new soft assumption (softVAR2)
+        // NOTE: if it false, the new constraint is enforced and if it is true it is ignored
         if(_mapAssum2Card[var].has_value()) { // If there is a cardinality constraint associated to this soft var
             int forCard = _mapAssum2Card[ var ]->card->atMost( _mapAssum2Card[ var ]->atMost + 1 );
 
@@ -1156,17 +1577,29 @@ private:
                     _poids.set(forCard, _mapAssum2Card[abs(forCard)]->initialWeight);
                     _mapWeight2Assum[_poids[forCard]].insert( forCard );
 
+                    NodeEntry& oldCardNode = *lit2CardC[lit];
+                    NodeEntry& newCardNode = addNode(NodeType::CardClause, _poids[forCard], {forCard}, oldCardNode.conflict, _mapAssum2Card[var]->atMost + 1, {});
+                    lit2CardC[forCard] = std::shared_ptr<NodeEntry>(&newCardNode);
+
+                    addProofStep(RuleID::RelaxCardinality, { {oldCardNode.addressID} }, { {newCardNode.addressID} });
+
                     newSoftVar = forCard;
                 }
             }
 
             if(_poids[lit] == 0) {
                 _mapAssum2Card[var].reset();
+                NodeEntry& cardNode = *lit2CardC[lit];
+                addProofStep(RuleID::ZeroWeightCardinality, { {cardNode.addressID} }, {});
+                lit2CardC[lit].reset();
             }
         }
         return newSoftVar;
     }
 
+    // NOTE: Find the next lower weight by looking for the largest weight below minWeightToConsider.
+    // NOTE: Only lower the weight if it's =< 50% of the previous weight
+    // NOTE: This weight is then used to control the assumption selection.
     t_weight chooseNextMinWeight(t_weight minWeightToConsider=std::numeric_limits<t_weight>::max()) {
         auto previousWeight = minWeightToConsider;
 
@@ -1197,18 +1630,15 @@ private:
                it2--;
                if(it2 == _mapWeight2Assum.end()) {
                    MonPrint("minWeightToConsider == ", 1);
+                   std::cout << "c [Proof] Choosing minWeightToConsider = 1" << std::endl;
                    return 1;
                }
 
-               /*
-               if(it2->first < it->first * 0.1 ) {   // hyper paramétre
-                   MonPrint("minWeightToConsider apres = ", it->first);
-                   return it->first;
-               }
-               */
-
                if(it2->first < previousWeight * 0.5) {  // hyper paramétre
                    MonPrint("minWeightToConsider = ", it->first);
+                   std::cout << "c [Proof] Updating minWeightToConsider from " << previousWeight 
+                          << " to " << it->first << std::endl;
+                return it->first;
                    return it->first;
                }
 

@@ -246,6 +246,8 @@ bool parse(const std::string& filePath, MAXSAT_SOLVER* solveur) {
 
     std::vector < std::tuple < std::vector<int>, t_weight> > softClauses;
 
+    std::cout << "c [Proof] Parsing input file: " << filePath << std::endl;
+
     for(;;) {
         skipWhitespace(in);
 
@@ -288,6 +290,8 @@ bool parse(const std::string& filePath, MAXSAT_SOLVER* solveur) {
     for(auto & [clause, weight]: softClauses) {
         solveur->addClause(clause, weight);
     }
+
+    std::cout << "c [Proof] Finished parsing input file." << std::endl;
 
     gzclose(gz);
     return true;

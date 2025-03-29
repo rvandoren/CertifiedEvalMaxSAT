@@ -80,10 +80,13 @@ void signalHandler( int signum ) {
 }
 
 
+// NOTE: template to allow different SAT solvers
+// NOTE: Function returns: (boolean: true if sol was found, Vector of booleans: actual sol, weight: cost of sol)
 template<class SOLVER>
 std::tuple<bool, std::vector<bool>, t_weight> solveFile(SOLVER *monMaxSat, std::string file, double targetComputationTime=3600) {
     cur_file = file;
 
+    // TODO: Look how the parsing works, especially how the solver is initialized
     if(!parse(file, monMaxSat)) {
         std::cerr << "Unable to read the file " << file << std::endl;
         assert(false);
@@ -91,13 +94,16 @@ std::tuple<bool, std::vector<bool>, t_weight> solveFile(SOLVER *monMaxSat, std::
     }
 
     monMaxSat->setTargetComputationTime( targetComputationTime - TotalChrono.tacSec() );
+    // NOTE: disable optimization for unweighted problems
     if(monMaxSat->isWeighted() == false) {
         monMaxSat->disableOptimize();
     }
+    // NOTE: actual solving of MaxSAT problem
     if(!monMaxSat->solve()) {
         //std::cout << "s UNSATISFIABLE" << std::endl;
         return std::make_tuple<bool, std::vector<bool>, t_weight>(false, {},-1);
     }
+    // NOTE: retrieve and validate solution
     auto solution = monMaxSat->getSolution();
     std::cout << "c nombre de var = " << solution.size() << std::endl;
     assert(monMaxSat->getCost() == calculateCost(file, solution));
@@ -154,6 +160,7 @@ int main(int argc, char *argv[])
     ///
     ////////////////////////////////////////
 
+    // NOTE: This is the actual solver class wrapper that is created
     monMaxSat = std::make_unique<EvalMaxSAT<Solver_cadical>>();
     monMaxSat->setCoef(initialCoef, coefOnRefTime);
     monMaxSat->setBoundRefTime(minimalRefTime, maximalRefTime);
@@ -168,6 +175,7 @@ int main(int argc, char *argv[])
         monMaxSat->unactivateUBStrategy();
     }
 
+    // NOTE: This function call solve the MaxSAT instance.
     auto [sat, solution, cost] = solveFile(monMaxSat.get(), file, targetComputationTime);
 
     if(bench) {
@@ -214,8 +222,3 @@ int main(int argc, char *argv[])
 
     return 0; // Bench mode
 }
-
-
-
-
-
