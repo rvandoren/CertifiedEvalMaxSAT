@@ -10,6 +10,8 @@
 #include <memory>
 
 #include "EvalMaxSAT.h"
+#include "proof_logger.h"
+#include "proof_checker.h"
 #include "lib/CLI11.hpp"
 
 using namespace MaLib;
@@ -86,7 +88,6 @@ template<class SOLVER>
 std::tuple<bool, std::vector<bool>, t_weight> solveFile(SOLVER *monMaxSat, std::string file, double targetComputationTime=3600) {
     cur_file = file;
 
-    // TODO: Look how the parsing works, especially how the solver is initialized
     if(!parse(file, monMaxSat)) {
         std::cerr << "Unable to read the file " << file << std::endl;
         assert(false);
@@ -177,6 +178,13 @@ int main(int argc, char *argv[])
 
     // NOTE: This function call solve the MaxSAT instance.
     auto [sat, solution, cost] = solveFile(monMaxSat.get(), file, targetComputationTime);
+    
+    // NOTE: THis function generates a proof log.
+    exportProofLog("proof.txt");
+
+    // NOTE: THis function checks the proof log.
+    auto proofCheckResult = checkProofFile("proof.txt");
+    std::cout << "The proof is " << proofCheckResult << std::endl;
 
     if(bench) {
         std::cout << file << "\t" << calculateCost(file, solution) << "\t" << TotalChrono.tacSec() << std::endl;
@@ -187,14 +195,14 @@ int main(int argc, char *argv[])
                 ///
                     std::cout << "o " << calculateCost(file, solution) << std::endl;
                     std::cout << "s OPTIMUM FOUND" << std::endl;
-                    std::cout << "v";
-                    for(unsigned int i=1; i<solution.size(); i++) {
-                        if(solution[i]) {
-                            std::cout << " " << i;
-                        } else {
-                            std::cout << " -" << i;
-                        }
-                    }
+                    // std::cout << "v";
+                    // for(unsigned int i=1; i<solution.size(); i++) {
+                    //     if(solution[i]) {
+                    //         std::cout << " " << i;
+                    //     } else {
+                    //         std::cout << " -" << i;
+                    //     }
+                    // }
                     std::cout << std::endl;
                 ///
                 ///////////////////////////////////////
@@ -203,11 +211,11 @@ int main(int argc, char *argv[])
                 ///
                     std::cout << "o " << calculateCost(file, solution) << std::endl;
                     std::cout << "s OPTIMUM FOUND" << std::endl;
-                    std::cout << "v ";
-                    for(unsigned int i=1; i<solution.size(); i++) {
-                        std::cout << solution[i];
-                    }
-                    std::cout << std::endl;
+                    // std::cout << "v ";
+                    // for(unsigned int i=1; i<solution.size(); i++) {
+                    //     std::cout << solution[i];
+                    // }
+                    // std::cout << std::endl;
                 ///
                 ///////////////////////////////////////
             }

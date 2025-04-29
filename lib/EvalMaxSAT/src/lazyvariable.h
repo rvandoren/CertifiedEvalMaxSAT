@@ -5,6 +5,7 @@
 #include <vector>
 #include <memory>
 #include <cassert>
+#include "proof_logger.h"
 
 
 
@@ -18,6 +19,7 @@ class LazyVariable {
     // For a node without 'var'. Lists clauses ; one of them should be satisfied for this variable to be "on" for the unary number.
     std::vector< std::vector< std::shared_ptr<LazyVariable<T>> > > impliquants;
 
+    std::vector<int> clauseAddressIDs;
 
 
 public:
@@ -72,10 +74,15 @@ public:
                 clause.push_back(*var);
 
                 solver->addClause( clause );
+                clauseAddressIDs.push_back(latestHardC->addressID);
             }
         }
 
         return *var;
+    }
+
+    const std::vector<int>& getClauseAddressIDs() const {
+        return clauseAddressIDs;
     }
 };
 

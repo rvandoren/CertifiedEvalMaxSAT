@@ -63,6 +63,21 @@ class CardIncremental_Lazy {
 
     };
 
+    void collectClauseIDs(const std::shared_ptr<TotTree>& node, unsigned int k, std::vector<int>& out) const {
+        if (!node) return;
+    
+        // Collect from this node’s lazyVars (only up to k)
+        unsigned limit = std::min(k + 1, static_cast<unsigned>(node->lazyVars.size()));
+        for (unsigned i = 0; i < limit; ++i) {
+            const auto& ids = node->lazyVars[i]->getClauseAddressIDs();
+            out.insert(out.end(), ids.begin(), ids.end());
+        }
+    
+        // Recurse on children
+        collectClauseIDs(node->left, k, out);
+        collectClauseIDs(node->right, k, out);
+    }
+
     std::shared_ptr<TotTree> _tree;
     unsigned int _maxVars; // Max number of literals in a tree, ignoring k-simplification
 public:
@@ -173,6 +188,18 @@ public:
 
         // Return the soft var corresponding to a cardinality constraint from the tree with a bound of k
         return -_tree->lazyVars[k]->get();
+    }
+
+    std::vector<int> getClauseIDsForBound(unsigned int k) const {
+        std::vector<int> result;
+        collectClauseIDs(_tree, k, result);
+        return result;
+    }
+
+    int getNumberOfLinkedIDs(unsigned int k) const {
+        std::vector<int> result;
+        collectClauseIDs(_tree, k, result);
+        return static_cast<int>(result.size());
     }
 
 

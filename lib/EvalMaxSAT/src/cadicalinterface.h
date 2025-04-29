@@ -16,7 +16,9 @@ class Solver_cadical {
     unsigned int nVar=0;
 public:
 
-    Solver_cadical() : solver(new CaDiCaL::Solver()) {}
+    Solver_cadical() : solver(new CaDiCaL::Solver()) {
+        solver->set("quiet", 1);
+    }
 
     ~Solver_cadical() {
         delete solver;
@@ -43,6 +45,8 @@ public:
         return solver->val(lit) > 0;
     }
 
+    size_t clauseCount = 0;
+
     std::vector<bool> getSolution() {
         std::vector<bool> res = solver->getSolution();
         if(res.size() <= nVar) {
@@ -68,6 +72,11 @@ public:
             solver->add(lit);
         }
        solver->add(0);
+       clauseCount++;
+    }
+
+    size_t getClauseCount() const {
+        return clauseCount;
     }
 
     void simplify() {
